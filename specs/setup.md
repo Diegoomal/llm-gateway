@@ -72,6 +72,8 @@ LLAMA_CPP_DEFAULT_MODEL=local-gguf-model
 DEFAULT_PROVIDER=ollama
 DEFAULT_TIMEOUT_SECONDS=60
 SQLITE_DATABASE_PATH=data/llm_gateway.sqlite3
+FALLBACK_PROVIDER=ollama
+FALLBACK_MODEL=llama3.1:latest
 ```
 
 For local development, these values can be exported in the shell:
@@ -86,6 +88,8 @@ export LLAMA_CPP_DEFAULT_MODEL=local-gguf-model
 export DEFAULT_PROVIDER=ollama
 export DEFAULT_TIMEOUT_SECONDS=60
 export SQLITE_DATABASE_PATH=data/llm_gateway.sqlite3
+export FALLBACK_PROVIDER=ollama
+export FALLBACK_MODEL=llama3.1:latest
 ```
 
 ## Local Providers

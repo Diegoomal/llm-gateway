@@ -26,10 +26,14 @@ class SQLiteRequestRepository:
                     status,
                     endpoint,
                     error,
+                    trace_id,
+                    latency_ms,
+                    provider_status_code,
+                    fallback_used,
                     request_payload,
                     response_payload
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.request_id,
@@ -38,6 +42,10 @@ class SQLiteRequestRepository:
                     response.status,
                     request.metadata.get("endpoint"),
                     response.error,
+                    response.trace_id or request.metadata.get("trace_id"),
+                    response.latency_ms,
+                    response.provider_status_code,
+                    int(response.fallback_used),
                     json.dumps(self._request_to_dict(request)),
                     json.dumps(self._response_to_dict(response)),
                 ),
@@ -93,12 +101,39 @@ class SQLiteRequestRepository:
                     status TEXT NOT NULL,
                     endpoint TEXT,
                     error TEXT,
+                    trace_id TEXT,
+                    latency_ms INTEGER,
+                    provider_status_code INTEGER,
+                    fallback_used INTEGER NOT NULL DEFAULT 0,
                     request_payload TEXT NOT NULL,
                     response_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            existing_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(llm_requests)"
+                ).fetchall()
+            }
+            migrations = {
+                "trace_id": "ALTER TABLE llm_requests ADD COLUMN trace_id TEXT",
+                "latency_ms": (
+                    "ALTER TABLE llm_requests ADD COLUMN latency_ms INTEGER"
+                ),
+                "provider_status_code": (
+                    "ALTER TABLE llm_requests "
+                    "ADD COLUMN provider_status_code INTEGER"
+                ),
+                "fallback_used": (
+                    "ALTER TABLE llm_requests "
+                    "ADD COLUMN fallback_used INTEGER NOT NULL DEFAULT 0"
+                ),
+            }
+            for column, statement in migrations.items():
+                if column not in existing_columns:
+                    connection.execute(statement)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_llm_requests_provider_model
@@ -157,6 +192,17 @@ class SQLiteRequestRepository:
             "embeddings": response.embeddings,
             "usage": asdict(response.usage),
             "error": response.error,
+            "trace_id": response.trace_id,
+            "provider_status_code": response.provider_status_code,
+            "fallback_used": response.fallback_used,
+            "fallback_from_provider": (
+                response.fallback_from_provider.value
+                if response.fallback_from_provider
+                else None
+            ),
+            "fallback_from_model": response.fallback_from_model,
+            "latency_ms": response.latency_ms,
+            "error_type": response.error_type,
             "raw": response.raw,
         }
 
@@ -170,5 +216,16 @@ class SQLiteRequestRepository:
             embeddings=data.get("embeddings"),
             usage=TokenUsage(**data.get("usage", {})),
             error=data.get("error"),
+            trace_id=data.get("trace_id"),
+            provider_status_code=data.get("provider_status_code"),
+            fallback_used=data.get("fallback_used", False),
+            fallback_from_provider=(
+                ProviderName.from_value(data["fallback_from_provider"])
+                if data.get("fallback_from_provider")
+                else None
+            ),
+            fallback_from_model=data.get("fallback_from_model"),
+            latency_ms=data.get("latency_ms"),
+            error_type=data.get("error_type"),
             raw=data.get("raw", {}),
         )

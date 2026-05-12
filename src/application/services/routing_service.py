@@ -9,17 +9,19 @@ class RoutingService:
         default_provider: ProviderName,
         default_models: dict[ProviderName, str],
         fallback_provider: ProviderName | None = None,
+        fallback_model: str | None = None,
     ):
         self.default_provider = default_provider
         self.default_models = default_models
         self.fallback_provider = fallback_provider
+        self.fallback_model = fallback_model
 
     def route(self, request: LLMRequest) -> ModelRoute:
         provider = request.provider or self.default_provider
         model = request.model or self.default_models[provider]
         fallback_provider = self._fallback_for(provider)
         fallback_model = (
-            self.default_models[fallback_provider]
+            self.fallback_model or self.default_models[fallback_provider]
             if fallback_provider is not None
             else None
         )

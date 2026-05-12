@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+import asyncio
 
 from application.ports.llm_provider import LLMProvider
 from domain.llm_request import LLMRequest
@@ -38,11 +39,17 @@ class FallbackService:
                 )
 
             try:
-                return await self._call_provider(
+                fallback_response = await self._call_provider(
                     request=request,
                     provider_name=route.fallback_provider.value,
                     model=route.fallback_model,
                     provider_call=provider_call,
+                )
+                return replace(
+                    fallback_response,
+                    fallback_used=True,
+                    fallback_from_provider=route.provider,
+                    fallback_from_model=route.model,
                 )
             except Exception as fallback_error:
                 return self._error_response(
@@ -77,7 +84,22 @@ class FallbackService:
             status="error",
             usage=TokenUsage(),
             error=str(error),
+            error_type=self._error_type(error),
         )
 
     def _provider_enum(self, provider: str):
         return ProviderName.from_value(provider)
+
+    def _error_type(self, error: Exception) -> str:
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, asyncio.TimeoutError):
+            return "timeout"
+        error_name = error.__class__.__name__.lower()
+        if "timeout" in error_name:
+            return "timeout"
+        if "connect" in error_name:
+            return "connection_error"
+        if "status" in error_name or "http" in error_name:
+            return "provider_http_error"
+        return "provider_error"

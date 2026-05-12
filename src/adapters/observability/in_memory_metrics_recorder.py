@@ -9,7 +9,9 @@ class InMemoryMetricsRecorder:
         self.duration_seconds = defaultdict(float)
         self.provider_errors_total = defaultdict(int)
         self.tokens_total = defaultdict(int)
+        self.tokens_per_second = defaultdict(float)
         self.active_requests = defaultdict(int)
+        self.fallbacks_total = defaultdict(int)
 
     def increment_active_requests(self, provider: str, model: str) -> None:
         self.active_requests[(provider, model)] += 1
@@ -33,6 +35,10 @@ class InMemoryMetricsRecorder:
         self.tokens_total[(provider, model, status, endpoint)] += (
             usage.total_tokens
         )
+        if duration_seconds > 0 and usage.total_tokens > 0:
+            self.tokens_per_second[labels] = (
+                usage.total_tokens / duration_seconds
+            )
 
     def record_provider_error(
         self,
@@ -41,6 +47,18 @@ class InMemoryMetricsRecorder:
         endpoint: str,
     ) -> None:
         self.provider_errors_total[(provider, model, endpoint)] += 1
+
+    def record_fallback(
+        self,
+        from_provider: str,
+        from_model: str,
+        to_provider: str,
+        to_model: str,
+        status: str,
+    ) -> None:
+        self.fallbacks_total[
+            (from_provider, from_model, to_provider, to_model, status)
+        ] += 1
 
     def render_prometheus(self) -> str:
         lines = []
@@ -73,11 +91,31 @@ class InMemoryMetricsRecorder:
                 f'{self._labels(provider, model, status, endpoint)} {value}'
             )
 
+        for labels, value in sorted(self.tokens_per_second.items()):
+            provider, model, status, endpoint = labels
+            lines.append(
+                "llm_tokens_per_second"
+                f'{self._labels(provider, model, status, endpoint)} {value}'
+            )
+
         for labels, value in sorted(self.active_requests.items()):
             provider, model = labels
             lines.append(
                 "llm_active_requests"
                 f'{{provider="{provider}",model="{model}"}} {value}'
+            )
+
+        for labels, value in sorted(self.fallbacks_total.items()):
+            from_provider, from_model, to_provider, to_model, status = labels
+            lines.append(
+                "llm_fallbacks_total"
+                "{"
+                f'from_provider="{from_provider}",'
+                f'from_model="{from_model}",'
+                f'to_provider="{to_provider}",'
+                f'to_model="{to_model}",'
+                f'status="{status}"'
+                f"}} {value}"
             )
 
         return "\n".join(lines) + "\n"

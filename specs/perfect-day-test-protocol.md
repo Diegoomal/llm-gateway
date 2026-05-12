@@ -54,6 +54,8 @@ export LLAMA_CPP_DEFAULT_MODEL=local-gguf-model
 export DEFAULT_PROVIDER=ollama
 export DEFAULT_TIMEOUT_SECONDS=60
 export SQLITE_DATABASE_PATH=data/perfect_day.sqlite3
+export FALLBACK_PROVIDER=ollama
+export FALLBACK_MODEL=llama3.1:latest
 ```
 
 Start providers before running the gateway:
@@ -82,6 +84,10 @@ The perfect day passes when:
 - `GET /metrics` includes `llm_requests_total`;
 - SQLite contains persisted rows in `llm_requests`;
 - Docker Compose config validates, when Docker is available.
+
+Instruction-following is evaluated separately from technical success. A chat
+request can return HTTP 200 and still receive `PASS_WITH_WARNING` when the
+model response is non-empty but differs from the exact expected content.
 
 ## Automated Protocol
 
@@ -206,6 +212,14 @@ Response contains:
 - model: llama3.2:1b
 - choices[0].message.content is not empty
 - error is null
+```
+
+Exact content classification:
+
+```text
+PASS: choices[0].message.content.strip() == "perfect day"
+PASS_WITH_WARNING: content is non-empty but different from "perfect day"
+FAIL: content is empty or the endpoint returns an error
 ```
 
 ### 7. Embeddings

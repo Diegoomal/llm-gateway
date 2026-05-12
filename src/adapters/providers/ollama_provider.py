@@ -45,6 +45,7 @@ class OllamaProvider(LLMProvider):
             status="success",
             content=message.get("content", ""),
             usage=usage,
+            provider_status_code=200,
             raw=data,
         )
 
@@ -62,6 +63,7 @@ class OllamaProvider(LLMProvider):
             model=payload["model"],
             status="success",
             embeddings=embeddings,
+            provider_status_code=200,
             raw=data,
         )
 
@@ -75,5 +77,11 @@ class OllamaProvider(LLMProvider):
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(f"{self.base_url}{path}", json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                detail = response.text[:300]
+                raise RuntimeError(
+                    f"ollama returned {response.status_code}: {detail}"
+                ) from error
             return response.json()

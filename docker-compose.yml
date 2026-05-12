@@ -17,6 +17,8 @@ services:
       DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-ollama}
       DEFAULT_TIMEOUT_SECONDS: ${DEFAULT_TIMEOUT_SECONDS:-60}
       SQLITE_DATABASE_PATH: ${SQLITE_DATABASE_PATH:-/app/data/llm_gateway.sqlite3}
+      FALLBACK_PROVIDER: ${FALLBACK_PROVIDER:-ollama}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-llama3.1:latest}
     volumes:
       - llm-gateway-data:/app/data
     extra_hosts:

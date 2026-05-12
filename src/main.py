@@ -1,11 +1,12 @@
 import asyncio
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from configurator import configure_gateway_container
 from domain.llm_request import LLMRequest
+from domain.llm_response import LLMResponse
 
 
 container = configure_gateway_container()
@@ -30,6 +31,15 @@ async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
         metadata={"raw_request": payload},
     )
     response = await container.gateway.chat_completion(request)
+    if not response.is_success:
+        raise HTTPException(
+            status_code=_status_code_for(response),
+            detail=_response_to_chat_payload(response),
+        )
+    return _response_to_chat_payload(response)
+
+
+def _response_to_chat_payload(response: LLMResponse) -> dict[str, Any]:
     return {
         "id": response.request_id,
         "object": "chat.completion",
@@ -61,7 +71,7 @@ async def embeddings(payload: dict[str, Any]) -> dict[str, Any]:
         metadata={"raw_request": payload},
     )
     response = await container.gateway.embeddings(request)
-    return {
+    payload = {
         "object": "list",
         "model": response.model,
         "provider": response.provider.value,
@@ -76,6 +86,12 @@ async def embeddings(payload: dict[str, Any]) -> dict[str, Any]:
         "usage": response.usage.__dict__,
         "error": response.error,
     }
+    if not response.is_success:
+        raise HTTPException(
+            status_code=_status_code_for(response),
+            detail=payload,
+        )
+    return payload
 
 
 @app.get("/v1/models")
@@ -98,6 +114,50 @@ async def list_models() -> dict[str, Any]:
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics() -> str:
     return container.metrics_recorder.render_prometheus()
+
+
+@app.get("/v1/requests")
+async def list_requests() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [
+            _history_record(request, response)
+            for request, response in container.gateway.list_requests()
+        ],
+    }
+
+
+@app.get("/v1/requests/{request_id}")
+async def get_request(request_id: str) -> dict[str, Any]:
+    record = container.gateway.get_request(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    request, response = record
+    return _history_record(request, response)
+
+
+def _history_record(
+    request: LLMRequest,
+    response: LLMResponse,
+) -> dict[str, Any]:
+    return {
+        "request_id": request.request_id,
+        "trace_id": response.trace_id,
+        "provider": response.provider.value,
+        "model": response.model,
+        "endpoint": request.metadata.get("endpoint"),
+        "status": response.status,
+        "error": response.error,
+        "fallback_used": response.fallback_used,
+        "latency_ms": response.latency_ms,
+        "usage": response.usage.__dict__,
+    }
+
+
+def _status_code_for(response: LLMResponse) -> int:
+    if response.error_type == "timeout":
+        return 504
+    return 502
 
 
 if __name__ == "__main__":

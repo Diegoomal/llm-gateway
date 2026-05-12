@@ -33,6 +33,8 @@ class Settings:
     default_provider: ProviderName
     default_timeout_seconds: int
     sqlite_database_path: str
+    fallback_provider: ProviderName | None
+    fallback_model: str | None
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,12 @@ def load_settings() -> Settings:
             "SQLITE_DATABASE_PATH",
             "data/llm_gateway.sqlite3",
         ),
+        fallback_provider=(
+            ProviderName.from_value(os.getenv("FALLBACK_PROVIDER"))
+            if os.getenv("FALLBACK_PROVIDER")
+            else None
+        ),
+        fallback_model=os.getenv("FALLBACK_MODEL"),
     )
 
 
@@ -98,11 +106,13 @@ def configure_gateway_container() -> GatewayContainer:
         ProviderName.OLLAMA: settings.ollama_default_model,
         ProviderName.LLAMA_CPP: settings.llama_cpp_default_model,
     }
-    fallback_provider = (
-        ProviderName.LLAMA_CPP
-        if settings.default_provider == ProviderName.OLLAMA
-        else ProviderName.OLLAMA
-    )
+    fallback_provider = settings.fallback_provider
+    if fallback_provider is None:
+        fallback_provider = (
+            ProviderName.LLAMA_CPP
+            if settings.default_provider == ProviderName.OLLAMA
+            else ProviderName.OLLAMA
+        )
 
     gateway = LLMGatewayService(
         providers=providers,
@@ -110,6 +120,7 @@ def configure_gateway_container() -> GatewayContainer:
             default_provider=settings.default_provider,
             default_models=default_models,
             fallback_provider=fallback_provider,
+            fallback_model=settings.fallback_model,
         ),
         fallback_service=FallbackService(providers),
         observability_service=ObservabilityService(metrics_recorder),

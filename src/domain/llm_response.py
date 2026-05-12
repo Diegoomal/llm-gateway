@@ -21,6 +21,13 @@ class LLMResponse:
     embeddings: list[list[float]] | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
     error: str | None = None
+    trace_id: str | None = None
+    provider_status_code: int | None = None
+    fallback_used: bool = False
+    fallback_from_provider: ProviderName | None = None
+    fallback_from_model: str | None = None
+    latency_ms: int | None = None
+    error_type: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

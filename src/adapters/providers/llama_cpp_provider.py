@@ -43,6 +43,7 @@ class LlamaCppProvider(LLMProvider):
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
             ),
+            provider_status_code=200,
             raw=data,
         )
 
@@ -69,6 +70,7 @@ class LlamaCppProvider(LLMProvider):
                 completion_tokens=0,
                 total_tokens=usage.get("total_tokens", 0),
             ),
+            provider_status_code=200,
             raw=data,
         )
 
@@ -82,5 +84,12 @@ class LlamaCppProvider(LLMProvider):
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(f"{self.base_url}{path}", json=payload)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                detail = response.text[:300]
+                raise RuntimeError(
+                    "llama.cpp returned "
+                    f"{response.status_code}: {detail}"
+                ) from error
             return response.json()

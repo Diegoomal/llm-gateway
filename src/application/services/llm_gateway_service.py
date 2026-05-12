@@ -1,4 +1,6 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
+from uuid import uuid4
 
 from application.ports.for_managing_llm_requests import (
     ForManagingLLMRequests,
@@ -50,6 +52,15 @@ class LLMGatewayService(ForManagingLLMRequests):
                 models[provider_name] = []
         return models
 
+    def list_requests(self) -> list[tuple[LLMRequest, LLMResponse]]:
+        return self.request_repository.find_all()
+
+    def get_request(
+        self,
+        request_id: str,
+    ) -> tuple[LLMRequest, LLMResponse] | None:
+        return self.request_repository.find_by_request_id(request_id)
+
     async def _execute(
         self,
         request: LLMRequest,
@@ -57,6 +68,8 @@ class LLMGatewayService(ForManagingLLMRequests):
         provider_method: str,
     ) -> LLMResponse:
         route = self.routing_service.route(request)
+        trace_id = request.metadata.get("trace_id") or str(uuid4())
+        request_size = self._payload_size(request)
         with self.observability_service.track_active_request(route) as timer:
             response = await self.fallback_service.execute(
                 request=request,
@@ -67,14 +80,31 @@ class LLMGatewayService(ForManagingLLMRequests):
                 )(routed_request),
             )
 
+        latency_ms = round(timer.duration_seconds * 1000)
+        response = replace(
+            response,
+            trace_id=trace_id,
+            latency_ms=latency_ms,
+        )
+        response_size = self._payload_size(response)
         persisted_request = replace(
             request,
-            metadata={**request.metadata, "endpoint": endpoint},
+            metadata={
+                **request.metadata,
+                "endpoint": endpoint,
+                "trace_id": trace_id,
+                "request_size": request_size,
+            },
         )
         self.request_repository.save(persisted_request, response)
         self.observability_service.record(
             response=response,
             endpoint=endpoint,
             duration_seconds=timer.duration_seconds,
+            request_size=request_size,
+            response_size=response_size,
         )
         return response
+
+    def _payload_size(self, payload) -> int:
+        return len(json.dumps(asdict(payload), default=str))

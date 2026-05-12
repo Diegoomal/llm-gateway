@@ -28,3 +28,13 @@ class MetricsRecorder(Protocol):
         endpoint: str,
     ) -> None:
         pass
+
+    def record_fallback(
+        self,
+        from_provider: str,
+        from_model: str,
+        to_provider: str,
+        to_model: str,
+        status: str,
+    ) -> None:
+        pass
