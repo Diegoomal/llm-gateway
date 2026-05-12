@@ -1,0 +1,18 @@
+# .ipybn
+wcwidth==0.2.13
+ipykernel==6.29.5
+ipywidgets==8.1.4
+jupyterlab-widgets==3.0.12
+widgetsnbextension==4.0.12
+
+# general use components
+pdoc==16.0.0
+flake8==6.0.0
+pytest==9.0.3
+python-dotenv==1.1.1
+fastapi==0.124.0
+httpx==0.28.1
+uvicorn==0.38.0
+
+# Components
+# ...

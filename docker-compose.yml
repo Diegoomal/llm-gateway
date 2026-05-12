@@ -1,0 +1,39 @@
+services:
+  llm-gateway:
+    build:
+      context: .
+      dockerfile: dockerfile
+    image: llm-gateway:local
+    container_name: llm-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      APP_NAME: llm-gateway
+      APP_ENV: local
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-llama3.2:1b}
+      LLAMA_CPP_BASE_URL: ${LLAMA_CPP_BASE_URL:-http://host.docker.internal:8080}
+      LLAMA_CPP_DEFAULT_MODEL: ${LLAMA_CPP_DEFAULT_MODEL:-local-gguf-model}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-ollama}
+      DEFAULT_TIMEOUT_SECONDS: ${DEFAULT_TIMEOUT_SECONDS:-60}
+      SQLITE_DATABASE_PATH: ${SQLITE_DATABASE_PATH:-/app/data/llm_gateway.sqlite3}
+    volumes:
+      - llm-gateway-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >
+          import urllib.request;
+          urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  llm-gateway-data:
