@@ -105,6 +105,8 @@ GET  /metrics
 
 - [Project overview](specs/overview.md)
 - [Project setup](specs/setup.md)
+- [Gateway usage commands](specs/gateway-usage-commands.md)
+- [Observability commands](specs/observability-commands.md)
 - [Perfect day test protocol](specs/perfect-day-test-protocol.md)
 - [Ports and Adapters](/tips-n-snippets/ports-and-adapters.md)
 - [Unit tests](/tips-n-snippets/unity-test.md)
