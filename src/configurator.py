@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from adapters.observability.in_memory_metrics_recorder import (
-    InMemoryMetricsRecorder,
+from adapters.observability.sqlite_metrics_recorder import (
+    SQLiteMetricsRecorder,
 )
 from adapters.persistence.sqlite_request_repository import (
     SQLiteRequestRepository,
@@ -15,6 +15,7 @@ from adapters.providers.ollama_provider import OllamaProvider
 from application.ports.for_managing_llm_requests import (
     ForManagingLLMRequests,
 )
+from application.ports.metrics_recorder import MetricsRecorder
 from application.services.fallback_service import FallbackService
 from application.services.llm_gateway_service import LLMGatewayService
 from application.services.observability_service import ObservabilityService
@@ -49,12 +50,17 @@ class Settings:
     provider_retry_base_delay_ms: int
     circuit_breaker_failure_threshold: int
     circuit_breaker_recovery_seconds: int
+    idempotency_retry_after_seconds: int
+    idempotency_record_ttl_seconds: int
+    sqlite_busy_timeout_ms: int
+    metric_events_ttl_seconds: int
+    cold_start_first_token_threshold_seconds: float
 
 
 @dataclass(frozen=True)
 class GatewayContainer:
     gateway: ForManagingLLMRequests
-    metrics_recorder: InMemoryMetricsRecorder
+    metrics_recorder: MetricsRecorder
     settings: Settings
 
 
@@ -117,6 +123,21 @@ def load_settings() -> Settings:
         circuit_breaker_recovery_seconds=int(
             os.getenv("CIRCUIT_BREAKER_RECOVERY_SECONDS", "30"),
         ),
+        idempotency_retry_after_seconds=int(
+            os.getenv("IDEMPOTENCY_RETRY_AFTER_SECONDS", "1"),
+        ),
+        idempotency_record_ttl_seconds=int(
+            os.getenv("IDEMPOTENCY_RECORD_TTL_SECONDS", "86400"),
+        ),
+        sqlite_busy_timeout_ms=int(
+            os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"),
+        ),
+        metric_events_ttl_seconds=int(
+            os.getenv("METRIC_EVENTS_TTL_SECONDS", "604800"),
+        ),
+        cold_start_first_token_threshold_seconds=float(
+            os.getenv("COLD_START_FIRST_TOKEN_THRESHOLD_SECONDS", "5"),
+        ),
     )
 
 
@@ -135,7 +156,11 @@ def _env_bool(name: str, default: bool) -> bool:
 def configure_gateway_container() -> GatewayContainer:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     settings = load_settings()
-    metrics_recorder = InMemoryMetricsRecorder()
+    metrics_recorder = SQLiteMetricsRecorder(
+        database_path=settings.sqlite_database_path,
+        sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
+        metric_events_ttl_seconds=settings.metric_events_ttl_seconds,
+    )
 
     providers = {
         ProviderName.OLLAMA.value: OllamaProvider(
@@ -171,9 +196,18 @@ def configure_gateway_container() -> GatewayContainer:
             fallback_model=settings.fallback_model,
         ),
         fallback_service=FallbackService(providers),
-        observability_service=ObservabilityService(metrics_recorder),
+        observability_service=ObservabilityService(
+            metrics_recorder,
+            cold_start_first_token_threshold_seconds=(
+                settings.cold_start_first_token_threshold_seconds
+            ),
+        ),
         request_repository=SQLiteRequestRepository(
             settings.sqlite_database_path,
+            idempotency_record_ttl_seconds=(
+                settings.idempotency_record_ttl_seconds
+            ),
+            sqlite_busy_timeout_ms=settings.sqlite_busy_timeout_ms,
         ),
         concurrency_limiter=ProviderConcurrencyLimiter(
             default_limit=settings.provider_max_concurrency,

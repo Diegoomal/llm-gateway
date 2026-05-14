@@ -41,3 +41,26 @@ class MetricsRecorder(Protocol):
 
     def record_idempotency_event(self, endpoint: str, status: str) -> None:
         pass
+
+    def record_generation_timing(
+        self,
+        provider: str,
+        model: str,
+        endpoint: str,
+        status: str,
+        first_token_latency_seconds: float | None = None,
+        generation_duration_seconds: float | None = None,
+    ) -> None:
+        pass
+
+    def record_cold_start_detected(
+        self,
+        provider: str,
+        model: str,
+        endpoint: str,
+        status: str,
+    ) -> None:
+        pass
+
+    def render_prometheus(self) -> str:
+        pass

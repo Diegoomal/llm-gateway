@@ -125,7 +125,14 @@ curl -N http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-Replay a completed non-streaming response with an idempotency key:
+## Idempotency
+
+Use `Idempotency-Key` on non-streaming chat completions when the client may
+retry the same logical request after a timeout, network failure, or process
+restart. The key should be unique per logical request and reused only with the
+same JSON payload.
+
+First request with a new key:
 
 ```bash
 curl -sS http://localhost:8000/v1/chat/completions \
@@ -143,9 +150,82 @@ curl -sS http://localhost:8000/v1/chat/completions \
   }' | jq
 ```
 
+Replay after the first request completed:
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-request-1" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Responda em uma frase: o que é um gateway de LLM?"
+      }
+    ]
+  }' | jq
+```
+
+The gateway returns the persisted response and does not execute the provider a
+second time.
+
+If the same key is reused with a different payload, the gateway returns `409`:
+
+```bash
+curl -i http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-request-1" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Payload diferente"
+      }
+    ]
+  }'
+```
+
 Concurrent requests using the same `Idempotency-Key` are not executed more than
-once. While the first request is still running, duplicates return `425`.
-Streaming requests with `Idempotency-Key` return `400`.
+once. While the first request is still running, duplicates return `425` with
+the body `"Request with this Idempotency-Key is still in progress"` and a
+`Retry-After` header. Clients should wait at least that number of seconds and
+retry with the same key and the exact same payload until they receive the
+completed replay or a terminal error. `IDEMPOTENCY_RETRY_AFTER_SECONDS`
+controls the header value and defaults to `1`.
+
+Idempotency records are retained for `IDEMPOTENCY_RECORD_TTL_SECONDS`, which
+defaults to `86400`. After expiration, the same key can be reserved again as a
+new logical request. The SQLite adapter removes expired records opportunistically
+when new idempotency keys are reserved.
+
+Streaming requests with `Idempotency-Key` return `400`:
+
+```bash
+curl -i -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: stream-request-1" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Responda em uma frase"
+      }
+    ]
+  }'
+```
+
+Streaming idempotency is rejected until the gateway can persist and replay SSE
+events exactly. Replaying only the final aggregated text would not reproduce the
+same streaming contract for clients.
+
+## Cache
 
 Use opt-in cache for a non-streaming request:
 
