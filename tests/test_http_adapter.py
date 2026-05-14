@@ -3,7 +3,8 @@ from fastapi.testclient import TestClient
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk
 from domain.provider_name import ProviderName
-from main import app, container
+from domain.request_history import RequestHistoryPage
+from main import _payload_hash, app, container
 
 
 class FakeGateway:
@@ -23,6 +24,7 @@ class FakeGateway:
             trace_id="trace-test",
             latency_ms=12,
         )
+        self.idempotent_record = None
 
     async def chat_completion(self, request):
         return LLMResponse(
@@ -58,10 +60,21 @@ class FakeGateway:
     def list_requests(self):
         return [(self.request, self.response)]
 
+    def list_request_page(self, limit, offset, filters=None):
+        return RequestHistoryPage(
+            items=[(self.request, self.response)],
+            total=1,
+            limit=limit,
+            offset=offset,
+        )
+
     def get_request(self, request_id):
         if request_id == self.request.request_id:
             return self.request, self.response
         return None
+
+    def get_idempotent_response(self, endpoint, idempotency_key):
+        return self.idempotent_record
 
 
 def test_http_error_response_is_controlled():
@@ -135,5 +148,60 @@ def test_request_history_endpoints_return_persisted_records():
             fake_gateway.request.request_id
         )
         assert missing_response.status_code == 404
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_request_history_endpoint_accepts_pagination_params():
+    original_gateway = container.gateway
+    fake_gateway = FakeGateway()
+    object.__setattr__(container, "gateway", fake_gateway)
+    try:
+        client = TestClient(app)
+
+        response = client.get("/v1/requests?limit=1&offset=0&provider=ollama")
+
+        assert response.status_code == 200
+        assert response.json()["limit"] == 1
+        assert response.json()["offset"] == 0
+        assert response.json()["total"] == 1
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_idempotency_key_replays_existing_response():
+    original_gateway = container.gateway
+    fake_gateway = FakeGateway()
+    request_payload = {
+        "model": "llama3.2:1b",
+        "provider": "ollama",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    request = LLMRequest.chat(
+        messages=request_payload["messages"],
+        model=request_payload["model"],
+        provider=request_payload["provider"],
+        metadata={"request_hash": _payload_hash(request_payload)},
+    )
+    response = LLMResponse(
+        request_id=request.request_id,
+        provider=ProviderName.OLLAMA,
+        model="llama3.2:1b",
+        status="success",
+        content="cached",
+    )
+    fake_gateway.idempotent_record = (request, response)
+    object.__setattr__(container, "gateway", fake_gateway)
+    try:
+        client = TestClient(app)
+
+        result = client.post(
+            "/v1/chat/completions",
+            headers={"Idempotency-Key": "same-key"},
+            json=request_payload,
+        )
+
+        assert result.status_code == 200
+        assert result.json()["choices"][0]["message"]["content"] == "cached"
     finally:
         object.__setattr__(container, "gateway", original_gateway)

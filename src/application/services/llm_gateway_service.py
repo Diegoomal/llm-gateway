@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+import asyncio
 from dataclasses import asdict, replace
 import json
 from uuid import uuid4
@@ -10,9 +11,14 @@ from application.ports.llm_provider import LLMProvider
 from application.ports.request_repository import RequestRepository
 from application.services.fallback_service import FallbackService
 from application.services.observability_service import ObservabilityService
+from application.services.provider_concurrency_limiter import (
+    ProviderConcurrencyLimiter,
+)
+from application.services.resilience_service import ResilienceService
 from application.services.routing_service import RoutingService
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
+from domain.request_history import RequestHistoryFilters, RequestHistoryPage
 
 
 class LLMGatewayService(ForManagingLLMRequests):
@@ -23,14 +29,23 @@ class LLMGatewayService(ForManagingLLMRequests):
         fallback_service: FallbackService,
         observability_service: ObservabilityService,
         request_repository: RequestRepository,
+        concurrency_limiter: ProviderConcurrencyLimiter | None = None,
+        resilience_service: ResilienceService | None = None,
     ):
         self.providers = providers
         self.routing_service = routing_service
         self.fallback_service = fallback_service
         self.observability_service = observability_service
         self.request_repository = request_repository
+        self.concurrency_limiter = concurrency_limiter or (
+            ProviderConcurrencyLimiter(default_limit=4)
+        )
+        self.resilience_service = resilience_service or ResilienceService()
 
     async def chat_completion(self, request: LLMRequest) -> LLMResponse:
+        cached_response = await self._cached_response_for(request)
+        if cached_response is not None:
+            return cached_response
         return await self._execute(
             request=request,
             endpoint="/v1/chat/completions",
@@ -172,7 +187,11 @@ class LLMGatewayService(ForManagingLLMRequests):
                 "request_size": request_size,
             },
         )
-        self.request_repository.save(persisted_request, response)
+        await asyncio.to_thread(
+            self.request_repository.save,
+            persisted_request,
+            response,
+        )
         self.observability_service.record(
             response=response,
             endpoint=endpoint,
@@ -200,11 +219,29 @@ class LLMGatewayService(ForManagingLLMRequests):
     def list_requests(self) -> list[tuple[LLMRequest, LLMResponse]]:
         return self.request_repository.find_all()
 
+    def list_request_page(
+        self,
+        limit: int,
+        offset: int,
+        filters: RequestHistoryFilters | None = None,
+    ) -> RequestHistoryPage:
+        return self.request_repository.find_page(limit, offset, filters)
+
     def get_request(
         self,
         request_id: str,
     ) -> tuple[LLMRequest, LLMResponse] | None:
         return self.request_repository.find_by_request_id(request_id)
+
+    def get_idempotent_response(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+    ) -> tuple[LLMRequest, LLMResponse] | None:
+        return self.request_repository.find_by_idempotency_key(
+            endpoint,
+            idempotency_key,
+        )
 
     async def _execute(
         self,
@@ -223,6 +260,7 @@ class LLMGatewayService(ForManagingLLMRequests):
                     provider,
                     provider_method,
                 )(routed_request),
+                call_wrapper=self._call_provider_with_resilience,
             )
 
         latency_ms = round(timer.duration_seconds * 1000)
@@ -241,7 +279,11 @@ class LLMGatewayService(ForManagingLLMRequests):
                 "request_size": request_size,
             },
         )
-        self.request_repository.save(persisted_request, response)
+        await asyncio.to_thread(
+            self.request_repository.save,
+            persisted_request,
+            response,
+        )
         self.observability_service.record(
             response=response,
             endpoint=endpoint,
@@ -262,7 +304,51 @@ class LLMGatewayService(ForManagingLLMRequests):
     ) -> AsyncIterator[LLMStreamChunk]:
         provider = self.providers[provider_name]
         routed_request = replace(request, model=model, stream=True)
-        return provider.stream_chat_completion(routed_request)
+        return self._limited_provider_stream(
+            provider_name,
+            model,
+            provider.stream_chat_completion(routed_request),
+        )
+
+    async def _call_provider_with_resilience(
+        self,
+        provider_name: str,
+        model: str,
+        call,
+    ):
+        async with self.concurrency_limiter.limit(provider_name):
+            return await self.resilience_service.execute(
+                provider=provider_name,
+                model=model,
+                call=call,
+            )
+
+    async def _limited_provider_stream(
+        self,
+        provider_name: str,
+        model: str,
+        stream: AsyncIterator[LLMStreamChunk],
+    ) -> AsyncIterator[LLMStreamChunk]:
+        async with self.concurrency_limiter.limit(provider_name):
+            try:
+                async for chunk in stream:
+                    yield chunk
+                self.resilience_service._record_success((provider_name, model))
+            except Exception:
+                self.resilience_service._record_failure((provider_name, model))
+                raise
+
+    async def _cached_response_for(
+        self,
+        request: LLMRequest,
+    ) -> LLMResponse | None:
+        cache_key = request.metadata.get("cache_key")
+        if not cache_key:
+            return None
+        return await asyncio.to_thread(
+            self.request_repository.find_cache_entry,
+            cache_key,
+        )
 
     async def _chain_first(
         self,

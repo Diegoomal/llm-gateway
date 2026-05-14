@@ -1,17 +1,26 @@
 import asyncio
+import hashlib
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from adapters.http.rate_limit_middleware import RateLimitMiddleware
 from configurator import configure_gateway_container
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk
+from domain.request_history import RequestHistoryFilters
 
 
 container = configure_gateway_container()
 app = FastAPI(title=container.settings.app_name)
+app.add_middleware(
+    RateLimitMiddleware,
+    enabled=container.settings.rate_limit_enabled,
+    requests_limit=container.settings.rate_limit_requests,
+    window_seconds=container.settings.rate_limit_window_seconds,
+)
 
 
 @app.get("/health")
@@ -24,13 +33,34 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(payload: dict[str, Any]):
+async def chat_completions(
+    payload: dict[str, Any],
+    idempotency_key: str | None = Header(default=None),
+):
+    endpoint = "/v1/chat/completions"
+    request_hash = _payload_hash(payload)
+    existing_response = await _idempotent_record(
+        endpoint,
+        idempotency_key,
+        request_hash,
+    )
+    if existing_response is not None:
+        return existing_response
+
+    metadata = {
+        "raw_request": payload,
+        "idempotency_key": idempotency_key,
+        "request_hash": request_hash,
+    }
+    if payload.get("cache") is True and not payload.get("stream", False):
+        metadata["cache_key"] = request_hash
+
     request = LLMRequest.chat(
         messages=payload.get("messages", []),
         model=payload.get("model"),
         provider=payload.get("provider"),
         stream=bool(payload.get("stream", False)),
-        metadata={"raw_request": payload},
+        metadata=metadata,
     )
     if request.stream:
         return StreamingResponse(
@@ -155,19 +185,40 @@ async def metrics() -> str:
 
 
 @app.get("/v1/requests")
-async def list_requests() -> dict[str, Any]:
+async def list_requests(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    provider: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+    endpoint: str | None = None,
+) -> dict[str, Any]:
+    page = await asyncio.to_thread(
+        container.gateway.list_request_page,
+        limit,
+        offset,
+        RequestHistoryFilters(
+            provider=provider,
+            model=model,
+            status=status,
+            endpoint=endpoint,
+        ),
+    )
     return {
         "object": "list",
+        "limit": page.limit,
+        "offset": page.offset,
+        "total": page.total,
         "data": [
             _history_record(request, response)
-            for request, response in container.gateway.list_requests()
+            for request, response in page.items
         ],
     }
 
 
 @app.get("/v1/requests/{request_id}")
 async def get_request(request_id: str) -> dict[str, Any]:
-    record = container.gateway.get_request(request_id)
+    record = await asyncio.to_thread(container.gateway.get_request, request_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Request not found")
     request, response = record
@@ -196,6 +247,39 @@ def _status_code_for(response: LLMResponse) -> int:
     if response.error_type == "timeout":
         return 504
     return 502
+
+
+def _payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _idempotent_record(
+    endpoint: str,
+    idempotency_key: str | None,
+    request_hash: str,
+):
+    if idempotency_key is None:
+        return None
+    record = await asyncio.to_thread(
+        container.gateway.get_idempotent_response,
+        endpoint,
+        idempotency_key,
+    )
+    if record is None:
+        return None
+
+    request, response = record
+    if request.metadata.get("request_hash") != request_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different payload",
+        )
+    return _response_to_chat_payload(response)
 
 
 if __name__ == "__main__":
