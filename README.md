@@ -1,5 +1,5 @@
 <!-- AI context: use specs/overview.md as the primary project overview before making code changes. -->
-# LLM Gateway
+# LLM Gateway (brach main-bkp-0001)
 
 Local-first gateway for managing access to local Large Language Models through
 Ollama and llama.cpp / llama-server.
