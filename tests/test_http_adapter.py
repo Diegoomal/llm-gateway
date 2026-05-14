@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse
+from domain.llm_response import LLMResponse, LLMStreamChunk
 from domain.provider_name import ProviderName
 from main import app, container
 
@@ -32,6 +32,21 @@ class FakeGateway:
             status="error",
             error="provider unavailable",
             error_type="provider_error",
+        )
+
+    async def stream_chat_completion(self, request):
+        yield LLMStreamChunk(
+            request_id=request.request_id,
+            provider=ProviderName.OLLAMA,
+            model=request.model,
+            content_delta="hello",
+        )
+        yield LLMStreamChunk(
+            request_id=request.request_id,
+            provider=ProviderName.OLLAMA,
+            model=request.model,
+            content_delta=" world",
+            finish_reason="stop",
         )
 
     async def embeddings(self, request):
@@ -66,6 +81,36 @@ def test_http_error_response_is_controlled():
 
         assert response.status_code == 502
         assert response.json()["detail"]["error"] == "provider unavailable"
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_http_stream_response_uses_openai_compatible_sse():
+    original_gateway = container.gateway
+    object.__setattr__(container, "gateway", FakeGateway())
+    try:
+        client = TestClient(app)
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.2:1b",
+                "provider": "ollama",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ) as response:
+            body = response.read().decode()
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(
+            "text/event-stream",
+        )
+        assert '"object": "chat.completion.chunk"' in body
+        assert '"content": "hello"' in body
+        assert '"content": " world"' in body
+        assert "data: [DONE]" in body
     finally:
         object.__setattr__(container, "gateway", original_gateway)
 

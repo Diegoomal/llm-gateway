@@ -33,3 +33,15 @@ class LLMResponse:
     @property
     def is_success(self) -> bool:
         return self.status == "success" and self.error is None
+
+
+@dataclass(frozen=True)
+class LLMStreamChunk:
+    request_id: str
+    provider: ProviderName
+    model: str
+    content_delta: str = ""
+    finish_reason: str | None = None
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    error: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)

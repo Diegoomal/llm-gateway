@@ -1,10 +1,12 @@
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
 from application.ports.llm_provider import LLMProvider
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse, TokenUsage
+from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
 from domain.provider_name import ProviderName
 
 
@@ -26,6 +28,7 @@ class LlamaCppProvider(LLMProvider):
                 {"role": message.role, "content": message.content}
                 for message in request.messages
             ],
+            "stream": request.stream,
         }
         data = await self._post("/v1/chat/completions", payload)
         choice = data.get("choices", [{}])[0]
@@ -46,6 +49,63 @@ class LlamaCppProvider(LLMProvider):
             provider_status_code=200,
             raw=data,
         )
+
+    async def stream_chat_completion(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        payload = {
+            "model": request.model or self.default_model,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in request.messages
+            ],
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as error:
+                    detail = (await response.aread()).decode()[:300]
+                    raise RuntimeError(
+                        "llama.cpp returned "
+                        f"{response.status_code}: {detail}"
+                    ) from error
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    event = line.removeprefix("data:").strip()
+                    if not event:
+                        continue
+                    if event == "[DONE]":
+                        break
+
+                    data = json.loads(event)
+                    choice = data.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    usage = data.get("usage") or {}
+                    yield LLMStreamChunk(
+                        request_id=request.request_id,
+                        provider=ProviderName.LLAMA_CPP,
+                        model=data.get("model", payload["model"]),
+                        content_delta=delta.get("content", ""),
+                        finish_reason=choice.get("finish_reason"),
+                        usage=TokenUsage(
+                            prompt_tokens=usage.get("prompt_tokens", 0),
+                            completion_tokens=usage.get(
+                                "completion_tokens",
+                                0,
+                            ),
+                            total_tokens=usage.get("total_tokens", 0),
+                        ),
+                        raw=data,
+                    )
 
     async def embeddings(self, request: LLMRequest) -> LLMResponse:
         payload = {

@@ -101,6 +101,11 @@ GET  /health
 GET  /metrics
 ```
 
+`POST /v1/chat/completions` accepts `stream: false` for a complete JSON
+response and `stream: true` for OpenAI-compatible server-sent events. Streaming
+is normalized for Ollama and llama.cpp/OpenAI-compatible providers and ends with
+`data: [DONE]`.
+
 ## Guides
 
 - [Project overview](specs/overview.md)

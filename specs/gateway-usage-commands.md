@@ -107,6 +107,24 @@ curl -sS http://localhost:8000/v1/chat/completions \
     }'
 ```
 
+Stream partial tokens as server-sent events:
+
+```bash
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Responda em uma frase: o que é um gateway de LLM?"
+      }
+    ]
+  }'
+```
+
 ## Embeddings
 
 Send an embedding request:

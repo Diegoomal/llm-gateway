@@ -1,10 +1,12 @@
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
 from application.ports.llm_provider import LLMProvider
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse, TokenUsage
+from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
 from domain.provider_name import ProviderName
 
 
@@ -26,7 +28,7 @@ class OllamaProvider(LLMProvider):
                 {"role": message.role, "content": message.content}
                 for message in request.messages
             ],
-            "stream": False,
+            "stream": request.stream,
         }
         data = await self._post("/api/chat", payload)
         message = data.get("message", {})
@@ -48,6 +50,55 @@ class OllamaProvider(LLMProvider):
             provider_status_code=200,
             raw=data,
         )
+
+    async def stream_chat_completion(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        payload = {
+            "model": request.model or self.default_model,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in request.messages
+            ],
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/api/chat",
+                json=payload,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as error:
+                    detail = (await response.aread()).decode()[:300]
+                    raise RuntimeError(
+                        f"ollama returned {response.status_code}: {detail}"
+                    ) from error
+
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    message = data.get("message", {})
+                    usage = TokenUsage(
+                        prompt_tokens=data.get("prompt_eval_count", 0),
+                        completion_tokens=data.get("eval_count", 0),
+                        total_tokens=(
+                            data.get("prompt_eval_count", 0)
+                            + data.get("eval_count", 0)
+                        ),
+                    )
+                    yield LLMStreamChunk(
+                        request_id=request.request_id,
+                        provider=ProviderName.OLLAMA,
+                        model=payload["model"],
+                        content_delta=message.get("content", ""),
+                        finish_reason="stop" if data.get("done") else None,
+                        usage=usage,
+                        raw=data,
+                    )
 
     async def embeddings(self, request: LLMRequest) -> LLMResponse:
         payload = {
