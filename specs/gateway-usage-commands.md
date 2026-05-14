@@ -125,6 +125,46 @@ curl -N http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+Replay a completed non-streaming response with an idempotency key:
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-request-1" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Responda em uma frase: o que é um gateway de LLM?"
+      }
+    ]
+  }' | jq
+```
+
+Concurrent requests using the same `Idempotency-Key` are not executed more than
+once. While the first request is still running, duplicates return `425`.
+Streaming requests with `Idempotency-Key` return `400`.
+
+Use opt-in cache for a non-streaming request:
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:1b",
+    "provider": "ollama",
+    "cache": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Responda em uma frase: o que é um gateway de LLM?"
+      }
+    ]
+  }' | jq
+```
+
 ## Embeddings
 
 Send an embedding request:
@@ -155,6 +195,16 @@ curl -sS http://localhost:8000/v1/embeddings \
       dimensions: (.data[0].embedding | length),
       usage
     }'
+```
+
+## Request History
+
+List persisted requests with pagination and filters:
+
+```bash
+curl -sS \
+  'http://localhost:8000/v1/requests?limit=20&offset=0&provider=ollama' \
+  | jq
 ```
 
 ## Provider Requirements

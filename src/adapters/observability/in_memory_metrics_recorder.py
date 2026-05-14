@@ -12,6 +12,7 @@ class InMemoryMetricsRecorder:
         self.tokens_per_second = defaultdict(float)
         self.active_requests = defaultdict(int)
         self.fallbacks_total = defaultdict(int)
+        self.idempotency_total = defaultdict(int)
 
     def increment_active_requests(self, provider: str, model: str) -> None:
         self.active_requests[(provider, model)] += 1
@@ -59,6 +60,9 @@ class InMemoryMetricsRecorder:
         self.fallbacks_total[
             (from_provider, from_model, to_provider, to_model, status)
         ] += 1
+
+    def record_idempotency_event(self, endpoint: str, status: str) -> None:
+        self.idempotency_total[(endpoint, status)] += 1
 
     def render_prometheus(self) -> str:
         lines = []
@@ -116,6 +120,13 @@ class InMemoryMetricsRecorder:
                 f'to_model="{to_model}",'
                 f'status="{status}"'
                 f"}} {value}"
+            )
+
+        for labels, value in sorted(self.idempotency_total.items()):
+            endpoint, status = labels
+            lines.append(
+                "llm_idempotency_total"
+                f'{{endpoint="{endpoint}",status="{status}"}} {value}'
             )
 
         return "\n".join(lines) + "\n"

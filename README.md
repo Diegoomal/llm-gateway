@@ -79,6 +79,19 @@ DEFAULT_TIMEOUT_SECONDS=60
 SQLITE_DATABASE_PATH=data/llm_gateway.sqlite3
 FALLBACK_PROVIDER=ollama
 FALLBACK_MODEL=llama3.1:latest
+
+PROVIDER_MAX_CONCURRENCY=4
+OLLAMA_MAX_CONCURRENCY=2
+LLAMA_CPP_MAX_CONCURRENCY=2
+
+PROVIDER_RETRY_ATTEMPTS=1
+PROVIDER_RETRY_BASE_DELAY_MS=100
+CIRCUIT_BREAKER_FAILURE_THRESHOLD=0
+CIRCUIT_BREAKER_RECOVERY_SECONDS=30
+
+RATE_LIMIT_ENABLED=false
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
 ```
 
 ## Commands
@@ -105,6 +118,17 @@ GET  /metrics
 response and `stream: true` for OpenAI-compatible server-sent events. Streaming
 is normalized for Ollama and llama.cpp/OpenAI-compatible providers and ends with
 `data: [DONE]`.
+
+The gateway also supports paginated request history, optional idempotency through
+the `Idempotency-Key` header, opt-in non-streaming response cache with
+`"cache": true`, provider concurrency limits, retry, circuit breaker, and
+optional in-memory rate limiting by API key, authorization header, or IP.
+
+Idempotency is atomic for non-streaming chat completions: the first request
+reserves the key before calling the provider, completed requests are replayed,
+payload conflicts return `409`, and concurrent duplicates return `425` while
+the first request is still in progress. `Idempotency-Key` is currently rejected
+for streaming requests.
 
 ## Guides
 

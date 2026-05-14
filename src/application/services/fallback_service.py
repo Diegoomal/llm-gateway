@@ -10,6 +10,10 @@ from domain.provider_name import ProviderName
 
 
 ProviderCall = Callable[[LLMProvider, LLMRequest], Awaitable[LLMResponse]]
+ProviderCallWrapper = Callable[
+    [str, str, Callable[[], Awaitable[LLMResponse]]],
+    Awaitable[LLMResponse],
+]
 
 
 class FallbackService:
@@ -21,6 +25,7 @@ class FallbackService:
         request: LLMRequest,
         route: ModelRoute,
         provider_call: ProviderCall,
+        call_wrapper: ProviderCallWrapper | None = None,
     ) -> LLMResponse:
         try:
             return await self._call_provider(
@@ -28,6 +33,7 @@ class FallbackService:
                 provider_name=route.provider.value,
                 model=route.model,
                 provider_call=provider_call,
+                call_wrapper=call_wrapper,
             )
         except Exception as primary_error:
             if route.fallback_provider is None or route.fallback_model is None:
@@ -44,6 +50,7 @@ class FallbackService:
                     provider_name=route.fallback_provider.value,
                     model=route.fallback_model,
                     provider_call=provider_call,
+                    call_wrapper=call_wrapper,
                 )
                 return replace(
                     fallback_response,
@@ -65,10 +72,17 @@ class FallbackService:
         provider_name: str,
         model: str,
         provider_call: ProviderCall,
+        call_wrapper: ProviderCallWrapper | None = None,
     ) -> LLMResponse:
         provider = self.providers[provider_name]
         routed_request = replace(request, model=model)
-        return await provider_call(provider, routed_request)
+
+        async def call() -> LLMResponse:
+            return await provider_call(provider, routed_request)
+
+        if call_wrapper is None:
+            return await call()
+        return await call_wrapper(provider_name, model, call)
 
     def _error_response(
         self,

@@ -18,6 +18,10 @@ from application.ports.for_managing_llm_requests import (
 from application.services.fallback_service import FallbackService
 from application.services.llm_gateway_service import LLMGatewayService
 from application.services.observability_service import ObservabilityService
+from application.services.provider_concurrency_limiter import (
+    ProviderConcurrencyLimiter,
+)
+from application.services.resilience_service import ResilienceService
 from application.services.routing_service import RoutingService
 from domain.provider_name import ProviderName
 
@@ -35,6 +39,16 @@ class Settings:
     sqlite_database_path: str
     fallback_provider: ProviderName | None
     fallback_model: str | None
+    provider_max_concurrency: int
+    ollama_max_concurrency: int | None
+    llama_cpp_max_concurrency: int | None
+    rate_limit_enabled: bool
+    rate_limit_requests: int
+    rate_limit_window_seconds: int
+    provider_retry_attempts: int
+    provider_retry_base_delay_ms: int
+    circuit_breaker_failure_threshold: int
+    circuit_breaker_recovery_seconds: int
 
 
 @dataclass(frozen=True)
@@ -81,7 +95,41 @@ def load_settings() -> Settings:
             else None
         ),
         fallback_model=os.getenv("FALLBACK_MODEL"),
+        provider_max_concurrency=int(
+            os.getenv("PROVIDER_MAX_CONCURRENCY", "4"),
+        ),
+        ollama_max_concurrency=_optional_int("OLLAMA_MAX_CONCURRENCY"),
+        llama_cpp_max_concurrency=_optional_int("LLAMA_CPP_MAX_CONCURRENCY"),
+        rate_limit_enabled=_env_bool("RATE_LIMIT_ENABLED", False),
+        rate_limit_requests=int(os.getenv("RATE_LIMIT_REQUESTS", "60")),
+        rate_limit_window_seconds=int(
+            os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"),
+        ),
+        provider_retry_attempts=int(
+            os.getenv("PROVIDER_RETRY_ATTEMPTS", "1"),
+        ),
+        provider_retry_base_delay_ms=int(
+            os.getenv("PROVIDER_RETRY_BASE_DELAY_MS", "100"),
+        ),
+        circuit_breaker_failure_threshold=int(
+            os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0"),
+        ),
+        circuit_breaker_recovery_seconds=int(
+            os.getenv("CIRCUIT_BREAKER_RECOVERY_SECONDS", "30"),
+        ),
     )
+
+
+def _optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    return int(value) if value else None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def configure_gateway_container() -> GatewayContainer:
@@ -126,6 +174,29 @@ def configure_gateway_container() -> GatewayContainer:
         observability_service=ObservabilityService(metrics_recorder),
         request_repository=SQLiteRequestRepository(
             settings.sqlite_database_path,
+        ),
+        concurrency_limiter=ProviderConcurrencyLimiter(
+            default_limit=settings.provider_max_concurrency,
+            provider_limits={
+                provider: limit
+                for provider, limit in {
+                    ProviderName.OLLAMA.value: settings.ollama_max_concurrency,
+                    ProviderName.LLAMA_CPP.value: (
+                        settings.llama_cpp_max_concurrency
+                    ),
+                }.items()
+                if limit is not None
+            },
+        ),
+        resilience_service=ResilienceService(
+            retry_attempts=settings.provider_retry_attempts,
+            retry_base_delay_ms=settings.provider_retry_base_delay_ms,
+            circuit_breaker_failure_threshold=(
+                settings.circuit_breaker_failure_threshold
+            ),
+            circuit_breaker_recovery_seconds=(
+                settings.circuit_breaker_recovery_seconds
+            ),
         ),
     )
 
