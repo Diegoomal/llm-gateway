@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from domain.idempotency import IdempotencyReservation
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk
 from domain.provider_name import ProviderName
@@ -76,6 +77,26 @@ class FakeGateway:
     def get_idempotent_response(self, endpoint, idempotency_key):
         return self.idempotent_record
 
+    def reserve_idempotency_key(
+        self,
+        endpoint,
+        idempotency_key,
+        request_hash,
+        request_id,
+    ):
+        if self.idempotent_record is None:
+            return IdempotencyReservation(status="reserved")
+        return IdempotencyReservation(
+            status="replayed",
+            response=self.idempotent_record[1],
+        )
+
+    def complete_idempotency_key(self, endpoint, idempotency_key, response):
+        self.idempotent_record = (self.request, response)
+
+    def fail_idempotency_key(self, endpoint, idempotency_key, error):
+        pass
+
 
 def test_http_error_response_is_controlled():
     original_gateway = container.gateway
@@ -124,6 +145,29 @@ def test_http_stream_response_uses_openai_compatible_sse():
         assert '"content": "hello"' in body
         assert '"content": " world"' in body
         assert "data: [DONE]" in body
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_streaming_request_rejects_idempotency_key():
+    original_gateway = container.gateway
+    object.__setattr__(container, "gateway", FakeGateway())
+    try:
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Idempotency-Key": "stream-key"},
+            json={
+                "model": "llama3.2:1b",
+                "provider": "ollama",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        assert response.status_code == 400
+        assert "not supported for streaming" in response.json()["detail"]
     finally:
         object.__setattr__(container, "gateway", original_gateway)
 

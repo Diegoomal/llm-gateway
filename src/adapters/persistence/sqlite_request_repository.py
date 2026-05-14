@@ -4,6 +4,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from domain.idempotency import (
+    IdempotencyConflict,
+    IdempotencyInProgress,
+    IdempotencyReservation,
+)
 from domain.llm_request import LLMMessage, LLMRequest
 from domain.llm_response import LLMResponse, TokenUsage
 from domain.provider_name import ProviderName
@@ -139,6 +144,103 @@ class SQLiteRequestRepository:
             return None
         return self._row_to_record(row)
 
+    def reserve_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        request_hash: str,
+        request_id: str,
+    ) -> IdempotencyReservation:
+        with self._connect() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_records (
+                        endpoint,
+                        idempotency_key,
+                        request_hash,
+                        request_id,
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, 'in_progress')
+                    """,
+                    (endpoint, idempotency_key, request_hash, request_id),
+                )
+                return IdempotencyReservation(status="reserved")
+            except sqlite3.IntegrityError:
+                row = connection.execute(
+                    """
+                    SELECT request_hash, status, response_payload, error
+                    FROM idempotency_records
+                    WHERE endpoint = ? AND idempotency_key = ?
+                    """,
+                    (endpoint, idempotency_key),
+                ).fetchone()
+
+        if row is None:
+            raise IdempotencyInProgress(
+                "Idempotency-Key reservation is temporarily unavailable"
+            )
+        if row["request_hash"] != request_hash:
+            raise IdempotencyConflict(
+                "Idempotency-Key was already used with a different payload"
+            )
+        if row["status"] == "completed" and row["response_payload"]:
+            return IdempotencyReservation(
+                status="replayed",
+                response=self._response_from_dict(
+                    json.loads(row["response_payload"]),
+                ),
+            )
+        if row["status"] == "failed":
+            raise IdempotencyInProgress(
+                row["error"] or "Request with this Idempotency-Key failed"
+            )
+        raise IdempotencyInProgress(
+            "Request with this Idempotency-Key is still in progress"
+        )
+
+    def complete_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        response: LLMResponse,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE idempotency_records
+                SET status = 'completed',
+                    response_payload = ?,
+                    error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE endpoint = ? AND idempotency_key = ?
+                """,
+                (
+                    json.dumps(self._response_to_dict(response)),
+                    endpoint,
+                    idempotency_key,
+                ),
+            )
+
+    def fail_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        error: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE idempotency_records
+                SET status = 'failed',
+                    error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE endpoint = ? AND idempotency_key = ?
+                """,
+                (error, endpoint, idempotency_key),
+            )
+
     def find_cache_entry(self, cache_key: str) -> LLMResponse | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -243,6 +345,28 @@ class SQLiteRequestRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_llm_requests_cache_key
                 ON llm_requests(cache_key)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency_records (
+                    endpoint TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    request_id TEXT,
+                    status TEXT NOT NULL,
+                    response_payload TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (endpoint, idempotency_key)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_idempotency_records_status
+                ON idempotency_records(status)
                 """
             )
 

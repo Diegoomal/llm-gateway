@@ -15,6 +15,7 @@ from application.services.provider_concurrency_limiter import (
     ProviderConcurrencyLimiter,
 )
 from application.services.resilience_service import ResilienceService
+from domain.idempotency import IdempotencyReservation
 from application.services.routing_service import RoutingService
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
@@ -241,6 +242,44 @@ class LLMGatewayService(ForManagingLLMRequests):
         return self.request_repository.find_by_idempotency_key(
             endpoint,
             idempotency_key,
+        )
+
+    def reserve_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        request_hash: str,
+        request_id: str,
+    ) -> IdempotencyReservation:
+        return self.request_repository.reserve_idempotency_key(
+            endpoint,
+            idempotency_key,
+            request_hash,
+            request_id,
+        )
+
+    def complete_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        response: LLMResponse,
+    ) -> None:
+        self.request_repository.complete_idempotency_key(
+            endpoint,
+            idempotency_key,
+            response,
+        )
+
+    def fail_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        error: str,
+    ) -> None:
+        self.request_repository.fail_idempotency_key(
+            endpoint,
+            idempotency_key,
+            error,
         )
 
     async def _execute(

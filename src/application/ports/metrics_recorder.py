@@ -38,3 +38,6 @@ class MetricsRecorder(Protocol):
         status: str,
     ) -> None:
         pass
+
+    def record_idempotency_event(self, endpoint: str, status: str) -> None:
+        pass

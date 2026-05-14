@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -8,6 +9,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from adapters.http.rate_limit_middleware import RateLimitMiddleware
 from configurator import configure_gateway_container
+from domain.idempotency import IdempotencyConflict, IdempotencyInProgress
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, LLMStreamChunk
 from domain.request_history import RequestHistoryFilters
@@ -15,6 +17,7 @@ from domain.request_history import RequestHistoryFilters
 
 container = configure_gateway_container()
 app = FastAPI(title=container.settings.app_name)
+logger = logging.getLogger("llm_gateway")
 app.add_middleware(
     RateLimitMiddleware,
     enabled=container.settings.rate_limit_enabled,
@@ -39,14 +42,6 @@ async def chat_completions(
 ):
     endpoint = "/v1/chat/completions"
     request_hash = _payload_hash(payload)
-    existing_response = await _idempotent_record(
-        endpoint,
-        idempotency_key,
-        request_hash,
-    )
-    if existing_response is not None:
-        return existing_response
-
     metadata = {
         "raw_request": payload,
         "idempotency_key": idempotency_key,
@@ -62,13 +57,55 @@ async def chat_completions(
         stream=bool(payload.get("stream", False)),
         metadata=metadata,
     )
+    if request.stream and idempotency_key is not None:
+        _record_idempotency(endpoint, "stream_unsupported")
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key is not supported for streaming requests yet",
+        )
+
+    idempotency_reserved = False
+    if idempotency_key is not None:
+        reservation = await _reserve_idempotency(
+            endpoint=endpoint,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            request_id=request.request_id,
+        )
+        if reservation.is_replay:
+            _record_idempotency(endpoint, "replayed")
+            return _response_to_chat_payload(reservation.response)
+        idempotency_reserved = reservation.is_reserved
+        _record_idempotency(endpoint, "reserved")
+
     if request.stream:
         return StreamingResponse(
             _chat_completion_event_stream(request),
             media_type="text/event-stream",
         )
 
-    response = await container.gateway.chat_completion(request)
+    try:
+        response = await container.gateway.chat_completion(request)
+    except Exception as error:
+        if idempotency_reserved and idempotency_key is not None:
+            await asyncio.to_thread(
+                container.gateway.fail_idempotency_key,
+                endpoint,
+                idempotency_key,
+                str(error),
+            )
+            _record_idempotency(endpoint, "failed")
+        raise
+
+    if idempotency_reserved and idempotency_key is not None:
+        await asyncio.to_thread(
+            container.gateway.complete_idempotency_key,
+            endpoint,
+            idempotency_key,
+            response,
+        )
+        _record_idempotency(endpoint, "completed")
+
     if not response.is_success:
         raise HTTPException(
             status_code=_status_code_for(response),
@@ -280,6 +317,65 @@ async def _idempotent_record(
             detail="Idempotency-Key was already used with a different payload",
         )
     return _response_to_chat_payload(response)
+
+
+async def _reserve_idempotency(
+    endpoint: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str,
+):
+    try:
+        reservation = await asyncio.to_thread(
+            container.gateway.reserve_idempotency_key,
+            endpoint,
+            idempotency_key,
+            request_hash,
+            request_id,
+        )
+    except IdempotencyConflict as error:
+        _record_idempotency(endpoint, "conflict")
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except IdempotencyInProgress as error:
+        _record_idempotency(endpoint, "in_progress")
+        raise HTTPException(status_code=425, detail=str(error)) from error
+
+    _log_idempotency_event(
+        event=f"idempotency_{reservation.status}",
+        endpoint=endpoint,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        request_id=request_id,
+    )
+    return reservation
+
+
+def _record_idempotency(endpoint: str, status: str) -> None:
+    container.metrics_recorder.record_idempotency_event(endpoint, status)
+
+
+def _log_idempotency_event(
+    event: str,
+    endpoint: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str,
+) -> None:
+    logger.info(
+        json.dumps(
+            {
+                "event": event,
+                "endpoint": endpoint,
+                "idempotency_key_hash": _hash_text(idempotency_key),
+                "request_hash": request_hash,
+                "request_id": request_id,
+            }
+        )
+    )
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 if __name__ == "__main__":

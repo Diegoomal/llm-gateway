@@ -2,6 +2,7 @@ from typing import Protocol
 
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse
+from domain.idempotency import IdempotencyReservation
 from domain.request_history import RequestHistoryFilters, RequestHistoryPage
 
 
@@ -31,6 +32,31 @@ class RequestRepository(Protocol):
         endpoint: str,
         idempotency_key: str,
     ) -> tuple[LLMRequest, LLMResponse] | None:
+        pass
+
+    def reserve_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        request_hash: str,
+        request_id: str,
+    ) -> IdempotencyReservation:
+        pass
+
+    def complete_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        response: LLMResponse,
+    ) -> None:
+        pass
+
+    def fail_idempotency_key(
+        self,
+        endpoint: str,
+        idempotency_key: str,
+        error: str,
+    ) -> None:
         pass
 
     def find_cache_entry(

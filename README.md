@@ -124,6 +124,12 @@ the `Idempotency-Key` header, opt-in non-streaming response cache with
 `"cache": true`, provider concurrency limits, retry, circuit breaker, and
 optional in-memory rate limiting by API key, authorization header, or IP.
 
+Idempotency is atomic for non-streaming chat completions: the first request
+reserves the key before calling the provider, completed requests are replayed,
+payload conflicts return `409`, and concurrent duplicates return `425` while
+the first request is still in progress. `Idempotency-Key` is currently rejected
+for streaming requests.
+
 ## Guides
 
 - [Project overview](specs/overview.md)

@@ -143,6 +143,10 @@ curl -sS http://localhost:8000/v1/chat/completions \
   }' | jq
 ```
 
+Concurrent requests using the same `Idempotency-Key` are not executed more than
+once. While the first request is still running, duplicates return `425`.
+Streaming requests with `Idempotency-Key` return `400`.
+
 Use opt-in cache for a non-streaming request:
 
 ```bash

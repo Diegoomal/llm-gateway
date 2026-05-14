@@ -1,6 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from adapters.persistence.sqlite_request_repository import (
     SQLiteRequestRepository,
 )
+from domain.idempotency import IdempotencyConflict, IdempotencyInProgress
 from domain.llm_request import LLMRequest
 from domain.llm_response import LLMResponse, TokenUsage
 from domain.provider_name import ProviderName
@@ -126,3 +129,92 @@ def test_find_by_idempotency_key_returns_existing_record(tmp_path):
         "/v1/chat/completions",
         "idem-1",
     ) == (request, response)
+
+
+def test_idempotency_reservation_is_atomic_and_replays_completed_response(
+    tmp_path,
+):
+    repository = SQLiteRequestRepository(
+        str(tmp_path / "llm_gateway.sqlite3"),
+    )
+    endpoint = "/v1/chat/completions"
+
+    reservation = repository.reserve_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="idem-atomic",
+        request_hash="hash-1",
+        request_id="request-1",
+    )
+
+    assert reservation.is_reserved
+
+    try:
+        repository.reserve_idempotency_key(
+            endpoint=endpoint,
+            idempotency_key="idem-atomic",
+            request_hash="hash-1",
+            request_id="request-2",
+        )
+    except IdempotencyInProgress as error:
+        assert "in progress" in str(error)
+    else:
+        raise AssertionError("expected in-progress idempotency error")
+
+    try:
+        repository.reserve_idempotency_key(
+            endpoint=endpoint,
+            idempotency_key="idem-atomic",
+            request_hash="different-hash",
+            request_id="request-3",
+        )
+    except IdempotencyConflict as error:
+        assert "different payload" in str(error)
+    else:
+        raise AssertionError("expected idempotency conflict")
+
+    response = LLMResponse(
+        request_id="request-1",
+        provider=ProviderName.OLLAMA,
+        model="llama3.2:1b",
+        status="success",
+        content="done",
+    )
+    repository.complete_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="idem-atomic",
+        response=response,
+    )
+
+    replay = repository.reserve_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="idem-atomic",
+        request_hash="hash-1",
+        request_id="request-4",
+    )
+
+    assert replay.is_replay
+    assert replay.response == response
+
+
+def test_concurrent_idempotency_reservations_have_single_winner(tmp_path):
+    database_path = str(tmp_path / "llm_gateway.sqlite3")
+    SQLiteRequestRepository(database_path)
+
+    def reserve(index):
+        repository = SQLiteRequestRepository(database_path)
+        try:
+            result = repository.reserve_idempotency_key(
+                endpoint="/v1/chat/completions",
+                idempotency_key="same-key",
+                request_hash="same-hash",
+                request_id=f"request-{index}",
+            )
+            return result.status
+        except IdempotencyInProgress:
+            return "in_progress"
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(reserve, range(10)))
+
+    assert results.count("reserved") == 1
+    assert results.count("in_progress") == 9
