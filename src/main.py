@@ -338,7 +338,15 @@ async def _reserve_idempotency(
         raise HTTPException(status_code=409, detail=str(error)) from error
     except IdempotencyInProgress as error:
         _record_idempotency(endpoint, "in_progress")
-        raise HTTPException(status_code=425, detail=str(error)) from error
+        raise HTTPException(
+            status_code=425,
+            detail=str(error),
+            headers={
+                "Retry-After": str(
+                    container.settings.idempotency_retry_after_seconds,
+                ),
+            },
+        ) from error
 
     _log_idempotency_event(
         event=f"idempotency_{reservation.status}",

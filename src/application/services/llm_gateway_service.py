@@ -70,6 +70,8 @@ class LLMGatewayService(ForManagingLLMRequests):
         error: str | None = None
         error_type: str | None = None
         status = "success"
+        first_token_latency_seconds: float | None = None
+        generation_duration_seconds: float | None = None
 
         with self.observability_service.track_active_request(route) as timer:
             stream = self._provider_stream(
@@ -79,7 +81,9 @@ class LLMGatewayService(ForManagingLLMRequests):
             )
             try:
                 first_chunk = await anext(stream)
+                first_token_latency_seconds = timer.duration_seconds
             except StopAsyncIteration:
+                first_token_latency_seconds = timer.duration_seconds
                 first_chunk = LLMStreamChunk(
                     request_id=request.request_id,
                     provider=route.provider,
@@ -115,6 +119,7 @@ class LLMGatewayService(ForManagingLLMRequests):
                     )
                     try:
                         first_chunk = await anext(stream)
+                        first_token_latency_seconds = timer.duration_seconds
                     except Exception as fallback_error:
                         error = str(fallback_error)
                         error_type = self.fallback_service._error_type(
@@ -156,6 +161,12 @@ class LLMGatewayService(ForManagingLLMRequests):
                     finish_reason="error",
                     error=error,
                 )
+            finally:
+                if first_token_latency_seconds is not None:
+                    generation_duration_seconds = max(
+                        0,
+                        timer.duration_seconds - first_token_latency_seconds,
+                    )
 
         latency_ms = round(timer.duration_seconds * 1000)
         response = LLMResponse(
@@ -199,6 +210,8 @@ class LLMGatewayService(ForManagingLLMRequests):
             duration_seconds=timer.duration_seconds,
             request_size=request_size,
             response_size=response_size,
+            first_token_latency_seconds=first_token_latency_seconds,
+            generation_duration_seconds=generation_duration_seconds,
         )
 
     async def embeddings(self, request: LLMRequest) -> LLMResponse:
@@ -281,6 +294,9 @@ class LLMGatewayService(ForManagingLLMRequests):
             idempotency_key,
             error,
         )
+
+    def delete_expired_idempotency_records(self) -> int:
+        return self.request_repository.delete_expired_idempotency_records()
 
     async def _execute(
         self,

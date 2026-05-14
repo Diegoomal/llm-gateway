@@ -2,6 +2,7 @@ import json
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
+from time import time
 from typing import Any
 
 from domain.idempotency import (
@@ -16,8 +17,15 @@ from domain.request_history import RequestHistoryFilters, RequestHistoryPage
 
 
 class SQLiteRequestRepository:
-    def __init__(self, database_path: str):
+    def __init__(
+        self,
+        database_path: str,
+        idempotency_record_ttl_seconds: int = 86400,
+        sqlite_busy_timeout_ms: int = 5000,
+    ):
         self.database_path = database_path
+        self.idempotency_record_ttl_seconds = idempotency_record_ttl_seconds
+        self.sqlite_busy_timeout_ms = sqlite_busy_timeout_ms
         self._ensure_parent_dir()
         self._initialize_schema()
 
@@ -152,6 +160,7 @@ class SQLiteRequestRepository:
         request_id: str,
     ) -> IdempotencyReservation:
         with self._connect() as connection:
+            self._delete_expired_idempotency_records(connection)
             try:
                 connection.execute(
                     """
@@ -160,11 +169,18 @@ class SQLiteRequestRepository:
                         idempotency_key,
                         request_hash,
                         request_id,
-                        status
+                        status,
+                        expires_at
                     )
-                    VALUES (?, ?, ?, ?, 'in_progress')
+                    VALUES (?, ?, ?, ?, 'in_progress', ?)
                     """,
-                    (endpoint, idempotency_key, request_hash, request_id),
+                    (
+                        endpoint,
+                        idempotency_key,
+                        request_hash,
+                        request_id,
+                        self._idempotency_expires_at(),
+                    ),
                 )
                 return IdempotencyReservation(status="reserved")
             except sqlite3.IntegrityError:
@@ -241,6 +257,11 @@ class SQLiteRequestRepository:
                 (error, endpoint, idempotency_key),
             )
 
+    def delete_expired_idempotency_records(self) -> int:
+        with self._connect() as connection:
+            cursor = self._delete_expired_idempotency_records(connection)
+            return cursor.rowcount
+
     def find_cache_entry(self, cache_key: str) -> LLMResponse | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -258,9 +279,33 @@ class SQLiteRequestRepository:
         return self._response_from_dict(json.loads(row["response_payload"]))
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.sqlite_busy_timeout_ms / 1000,
+        )
         connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout = {self.sqlite_busy_timeout_ms}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        if self.database_path != ":memory:":
+            connection.execute("PRAGMA journal_mode = WAL")
         return connection
+
+    def _delete_expired_idempotency_records(
+        self,
+        connection: sqlite3.Connection,
+    ) -> sqlite3.Cursor:
+        return connection.execute(
+            """
+            DELETE FROM idempotency_records
+            WHERE expires_at IS NOT NULL AND expires_at <= ?
+            """,
+            (int(time()),),
+        )
+
+    def _idempotency_expires_at(self) -> int | None:
+        if self.idempotency_record_ttl_seconds <= 0:
+            return None
+        return int(time()) + self.idempotency_record_ttl_seconds
 
     def _ensure_parent_dir(self) -> None:
         if self.database_path == ":memory:":
@@ -357,16 +402,33 @@ class SQLiteRequestRepository:
                     status TEXT NOT NULL,
                     response_payload TEXT,
                     error TEXT,
+                    expires_at INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (endpoint, idempotency_key)
                 )
                 """
             )
+            existing_idempotency_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(idempotency_records)"
+                ).fetchall()
+            }
+            if "expires_at" not in existing_idempotency_columns:
+                connection.execute(
+                    "ALTER TABLE idempotency_records ADD COLUMN expires_at INTEGER"
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_idempotency_records_status
                 ON idempotency_records(status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_idempotency_records_expires_at
+                ON idempotency_records(expires_at)
                 """
             )
 

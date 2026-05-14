@@ -185,6 +185,13 @@ def test_stream_chat_completion_persists_aggregated_response(tmp_path):
     assert saved_response.content == "hello world"
     assert saved_response.usage.total_tokens == 3
     assert sum(metrics.requests_total.values()) == 1
+    assert sum(metrics.first_token_latency_seconds.values()) >= 0
+    assert sum(metrics.generation_duration_seconds.values()) >= 0
+    assert "llm_first_token_latency_seconds" in metrics.render_prometheus()
+    assert "llm_generation_duration_seconds" in metrics.render_prometheus()
+    assert "llm_request_duration_seconds_bucket" in metrics.render_prometheus()
+    assert "llm_first_token_latency_seconds_bucket" in metrics.render_prometheus()
+    assert "llm_generation_duration_seconds_bucket" in metrics.render_prometheus()
 
 
 def test_stream_chat_completion_falls_back_before_first_chunk(tmp_path):

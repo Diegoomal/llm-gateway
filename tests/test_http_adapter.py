@@ -1,8 +1,23 @@
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
 from fastapi.testclient import TestClient
 
-from domain.idempotency import IdempotencyReservation
+from adapters.observability.in_memory_metrics_recorder import (
+    InMemoryMetricsRecorder,
+)
+from adapters.persistence.sqlite_request_repository import (
+    SQLiteRequestRepository,
+)
+from application.services.fallback_service import FallbackService
+from application.services.llm_gateway_service import LLMGatewayService
+from application.services.observability_service import ObservabilityService
+from application.services.routing_service import RoutingService
+from domain.idempotency import IdempotencyInProgress, IdempotencyReservation
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse, LLMStreamChunk
+from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
 from domain.provider_name import ProviderName
 from domain.request_history import RequestHistoryPage
 from main import _payload_hash, app, container
@@ -96,6 +111,92 @@ class FakeGateway:
 
     def fail_idempotency_key(self, endpoint, idempotency_key, error):
         pass
+
+
+class InProgressGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.executions = 0
+        self.in_progress = False
+        self.lock = Lock()
+
+    async def chat_completion(self, request):
+        self.executions += 1
+        time.sleep(0.1)
+        return LLMResponse(
+            request_id=request.request_id,
+            provider=ProviderName.OLLAMA,
+            model=request.model,
+            status="success",
+            content="completed",
+        )
+
+    def reserve_idempotency_key(
+        self,
+        endpoint,
+        idempotency_key,
+        request_hash,
+        request_id,
+    ):
+        with self.lock:
+            if self.in_progress:
+                raise IdempotencyInProgress(
+                    "Request with this Idempotency-Key is still in progress",
+                )
+            self.in_progress = True
+            return IdempotencyReservation(status="reserved")
+
+    def complete_idempotency_key(self, endpoint, idempotency_key, response):
+        self.in_progress = False
+        self.idempotent_record = (self.request, response)
+
+
+class SlowProvider:
+    def __init__(self):
+        self.requests = []
+
+    async def chat_completion(self, request):
+        self.requests.append(request)
+        await asyncio.sleep(0.1)
+        return LLMResponse(
+            request_id=request.request_id,
+            provider=ProviderName.OLLAMA,
+            model=request.model,
+            status="success",
+            content="completed",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def stream_chat_completion(self, request):
+        if False:
+            yield
+
+    async def embeddings(self, request):
+        return await self.chat_completion(request)
+
+    async def list_models(self):
+        return ["llama3.2:1b"]
+
+
+def make_real_gateway(tmp_path):
+    repository = SQLiteRequestRepository(
+        str(tmp_path / "llm_gateway.sqlite3"),
+    )
+    metrics = InMemoryMetricsRecorder()
+    provider = SlowProvider()
+    providers = {ProviderName.OLLAMA.value: provider}
+    gateway = LLMGatewayService(
+        providers=providers,
+        routing_service=RoutingService(
+            default_provider=ProviderName.OLLAMA,
+            default_models={ProviderName.OLLAMA: "llama3.2:1b"},
+            fallback_provider=None,
+        ),
+        fallback_service=FallbackService(providers),
+        observability_service=ObservabilityService(metrics),
+        request_repository=repository,
+    )
+    return gateway, provider
 
 
 def test_http_error_response_is_controlled():
@@ -247,5 +348,88 @@ def test_idempotency_key_replays_existing_response():
 
         assert result.status_code == 200
         assert result.json()["choices"][0]["message"]["content"] == "cached"
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_concurrent_idempotency_425_includes_retry_after():
+    original_gateway = container.gateway
+    fake_gateway = InProgressGateway()
+    object.__setattr__(container, "gateway", fake_gateway)
+    try:
+        client = TestClient(app)
+        request_payload = {
+            "model": "llama3.2:1b",
+            "provider": "ollama",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        def post():
+            return client.post(
+                "/v1/chat/completions",
+                headers={"Idempotency-Key": "same-key"},
+                json=request_payload,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(lambda _: post(), range(2)))
+
+        too_early = [
+            response for response in responses if response.status_code == 425
+        ]
+        success = [
+            response for response in responses if response.status_code == 200
+        ]
+
+        assert len(too_early) == 1
+        assert len(success) == 1
+        assert too_early[0].json()["detail"] == (
+            "Request with this Idempotency-Key is still in progress"
+        )
+        assert too_early[0].headers["Retry-After"] == "1"
+        assert fake_gateway.executions == 1
+    finally:
+        object.__setattr__(container, "gateway", original_gateway)
+
+
+def test_concurrent_http_idempotency_uses_single_real_execution(tmp_path):
+    original_gateway = container.gateway
+    gateway, provider = make_real_gateway(tmp_path)
+    object.__setattr__(container, "gateway", gateway)
+    try:
+        client = TestClient(app)
+        request_payload = {
+            "model": "llama3.2:1b",
+            "provider": "ollama",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        def post():
+            return client.post(
+                "/v1/chat/completions",
+                headers={"Idempotency-Key": "real-key"},
+                json=request_payload,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(lambda _: post(), range(2)))
+
+        assert sorted(response.status_code for response in responses) == [
+            200,
+            425,
+        ]
+        assert len(provider.requests) == 1
+        too_early = next(
+            response for response in responses if response.status_code == 425
+        )
+        assert too_early.headers["Retry-After"] == "1"
+
+        replay = post()
+
+        assert replay.status_code == 200
+        assert replay.json()["choices"][0]["message"]["content"] == (
+            "completed"
+        )
+        assert len(provider.requests) == 1
     finally:
         object.__setattr__(container, "gateway", original_gateway)

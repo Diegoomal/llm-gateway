@@ -59,6 +59,9 @@ class RequestRepository(Protocol):
     ) -> None:
         pass
 
+    def delete_expired_idempotency_records(self) -> int:
+        pass
+
     def find_cache_entry(
         self,
         cache_key: str,

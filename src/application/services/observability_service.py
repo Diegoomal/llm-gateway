@@ -23,8 +23,15 @@ class RequestTimer:
 
 
 class ObservabilityService:
-    def __init__(self, metrics_recorder: MetricsRecorder):
+    def __init__(
+        self,
+        metrics_recorder: MetricsRecorder,
+        cold_start_first_token_threshold_seconds: float = 5,
+    ):
         self.metrics_recorder = metrics_recorder
+        self.cold_start_first_token_threshold_seconds = (
+            cold_start_first_token_threshold_seconds
+        )
 
     @contextmanager
     def track_active_request(self, route: ModelRoute) -> Iterator[RequestTimer]:
@@ -48,6 +55,8 @@ class ObservabilityService:
         duration_seconds: float,
         request_size: int = 0,
         response_size: int = 0,
+        first_token_latency_seconds: float | None = None,
+        generation_duration_seconds: float | None = None,
     ) -> None:
         self.metrics_recorder.record_request(
             provider=response.provider.value,
@@ -57,6 +66,25 @@ class ObservabilityService:
             duration_seconds=duration_seconds,
             usage=response.usage,
         )
+        self.metrics_recorder.record_generation_timing(
+            provider=response.provider.value,
+            model=response.model,
+            endpoint=endpoint,
+            status=response.status,
+            first_token_latency_seconds=first_token_latency_seconds,
+            generation_duration_seconds=generation_duration_seconds,
+        )
+        if (
+            first_token_latency_seconds is not None
+            and first_token_latency_seconds
+            >= self.cold_start_first_token_threshold_seconds
+        ):
+            self.metrics_recorder.record_cold_start_detected(
+                provider=response.provider.value,
+                model=response.model,
+                endpoint=endpoint,
+                status=response.status,
+            )
 
         if response.error:
             self.metrics_recorder.record_provider_error(
@@ -93,6 +121,16 @@ class ObservabilityService:
                     "fallback_used": response.fallback_used,
                     "request_size": request_size,
                     "response_size": response_size,
+                    "first_token_latency_ms": (
+                        round(first_token_latency_seconds * 1000)
+                        if first_token_latency_seconds is not None
+                        else None
+                    ),
+                    "generation_duration_ms": (
+                        round(generation_duration_seconds * 1000)
+                        if generation_duration_seconds is not None
+                        else None
+                    ),
                     "prompt_tokens": response.usage.prompt_tokens,
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens,

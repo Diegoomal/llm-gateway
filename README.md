@@ -77,6 +77,8 @@ LLAMA_CPP_DEFAULT_MODEL=local-gguf-model
 DEFAULT_PROVIDER=ollama
 DEFAULT_TIMEOUT_SECONDS=60
 SQLITE_DATABASE_PATH=data/llm_gateway.sqlite3
+SQLITE_BUSY_TIMEOUT_MS=5000
+METRIC_EVENTS_TTL_SECONDS=604800
 FALLBACK_PROVIDER=ollama
 FALLBACK_MODEL=llama3.1:latest
 
@@ -92,6 +94,10 @@ CIRCUIT_BREAKER_RECOVERY_SECONDS=30
 RATE_LIMIT_ENABLED=false
 RATE_LIMIT_REQUESTS=60
 RATE_LIMIT_WINDOW_SECONDS=60
+
+IDEMPOTENCY_RETRY_AFTER_SECONDS=1
+IDEMPOTENCY_RECORD_TTL_SECONDS=86400
+COLD_START_FIRST_TOKEN_THRESHOLD_SECONDS=5
 ```
 
 ## Commands
@@ -126,9 +132,17 @@ optional in-memory rate limiting by API key, authorization header, or IP.
 
 Idempotency is atomic for non-streaming chat completions: the first request
 reserves the key before calling the provider, completed requests are replayed,
-payload conflicts return `409`, and concurrent duplicates return `425` while
-the first request is still in progress. `Idempotency-Key` is currently rejected
-for streaming requests.
+payload conflicts return `409`, and concurrent duplicates return `425` with a
+`Retry-After` header while the first request is still in progress.
+Idempotency records expire after `IDEMPOTENCY_RECORD_TTL_SECONDS` to avoid
+unbounded growth and allow old keys to be reused after the retention window.
+`Idempotency-Key` is currently rejected for streaming requests because replaying
+server-sent events safely requires a dedicated persisted event log.
+
+Historical metrics are persisted as SQLite events and rendered as
+Prometheus-compatible text from those events, so counters and latency
+histograms survive process restarts. `llm_active_requests` remains in memory
+because it represents only current runtime state.
 
 ## Guides
 

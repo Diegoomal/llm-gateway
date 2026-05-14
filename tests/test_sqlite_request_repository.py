@@ -218,3 +218,65 @@ def test_concurrent_idempotency_reservations_have_single_winner(tmp_path):
 
     assert results.count("reserved") == 1
     assert results.count("in_progress") == 9
+
+
+def test_expired_idempotency_record_can_be_reused(tmp_path):
+    repository = SQLiteRequestRepository(
+        str(tmp_path / "llm_gateway.sqlite3"),
+        idempotency_record_ttl_seconds=1,
+    )
+    endpoint = "/v1/chat/completions"
+
+    first = repository.reserve_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="expired-key",
+        request_hash="hash-1",
+        request_id="request-1",
+    )
+
+    assert first.is_reserved
+
+    with repository._connect() as connection:
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET expires_at = 1
+            WHERE endpoint = ? AND idempotency_key = ?
+            """,
+            (endpoint, "expired-key"),
+        )
+
+    second = repository.reserve_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="expired-key",
+        request_hash="hash-2",
+        request_id="request-2",
+    )
+
+    assert second.is_reserved
+
+
+def test_delete_expired_idempotency_records_returns_deleted_count(tmp_path):
+    repository = SQLiteRequestRepository(
+        str(tmp_path / "llm_gateway.sqlite3"),
+        idempotency_record_ttl_seconds=1,
+    )
+    endpoint = "/v1/chat/completions"
+    repository.reserve_idempotency_key(
+        endpoint=endpoint,
+        idempotency_key="expired-key",
+        request_hash="hash-1",
+        request_id="request-1",
+    )
+
+    with repository._connect() as connection:
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET expires_at = 1
+            WHERE endpoint = ? AND idempotency_key = ?
+            """,
+            (endpoint, "expired-key"),
+        )
+
+    assert repository.delete_expired_idempotency_records() == 1
