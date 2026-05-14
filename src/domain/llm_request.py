@@ -18,6 +18,7 @@ class LLMRequest:
     provider: ProviderName | None = None
     messages: list[LLMMessage] = field(default_factory=list)
     input: str | list[str] | None = None
+    stream: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -26,6 +27,7 @@ class LLMRequest:
         messages: list[dict[str, str]] | list[LLMMessage],
         model: str | None = None,
         provider: str | ProviderName | None = None,
+        stream: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> "LLMRequest":
         return cls(
@@ -40,6 +42,7 @@ class LLMRequest:
                 )
                 for message in messages
             ],
+            stream=stream,
             metadata=metadata or {},
         )
 

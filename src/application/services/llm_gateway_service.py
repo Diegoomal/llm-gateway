@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 import json
 from uuid import uuid4
@@ -11,7 +12,7 @@ from application.services.fallback_service import FallbackService
 from application.services.observability_service import ObservabilityService
 from application.services.routing_service import RoutingService
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse
+from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
 
 
 class LLMGatewayService(ForManagingLLMRequests):
@@ -34,6 +35,150 @@ class LLMGatewayService(ForManagingLLMRequests):
             request=request,
             endpoint="/v1/chat/completions",
             provider_method="chat_completion",
+        )
+
+    async def stream_chat_completion(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        endpoint = "/v1/chat/completions"
+        route = self.routing_service.route(request)
+        trace_id = request.metadata.get("trace_id") or str(uuid4())
+        request_size = self._payload_size(request)
+        content_parts: list[str] = []
+        final_usage = TokenUsage()
+        final_chunk: LLMStreamChunk | None = None
+        fallback_used = False
+        fallback_from_provider = None
+        fallback_from_model = None
+        error: str | None = None
+        error_type: str | None = None
+        status = "success"
+
+        with self.observability_service.track_active_request(route) as timer:
+            stream = self._provider_stream(
+                request=request,
+                provider_name=route.provider.value,
+                model=route.model,
+            )
+            try:
+                first_chunk = await anext(stream)
+            except StopAsyncIteration:
+                first_chunk = LLMStreamChunk(
+                    request_id=request.request_id,
+                    provider=route.provider,
+                    model=route.model,
+                    finish_reason="stop",
+                )
+            except Exception as primary_error:
+                if (
+                    route.fallback_provider is None
+                    or route.fallback_model is None
+                ):
+                    error = str(primary_error)
+                    error_type = self.fallback_service._error_type(
+                        primary_error,
+                    )
+                    status = "error"
+                    first_chunk = LLMStreamChunk(
+                        request_id=request.request_id,
+                        provider=route.provider,
+                        model=route.model,
+                        finish_reason="error",
+                        error=error,
+                    )
+                    stream = self._empty_stream()
+                else:
+                    fallback_used = True
+                    fallback_from_provider = route.provider
+                    fallback_from_model = route.model
+                    stream = self._provider_stream(
+                        request=request,
+                        provider_name=route.fallback_provider.value,
+                        model=route.fallback_model,
+                    )
+                    try:
+                        first_chunk = await anext(stream)
+                    except Exception as fallback_error:
+                        error = str(fallback_error)
+                        error_type = self.fallback_service._error_type(
+                            fallback_error,
+                        )
+                        status = "error"
+                        first_chunk = LLMStreamChunk(
+                            request_id=request.request_id,
+                            provider=route.fallback_provider,
+                            model=route.fallback_model,
+                            finish_reason="error",
+                            error=error,
+                        )
+                        stream = self._empty_stream()
+
+            try:
+                async for chunk in self._chain_first(first_chunk, stream):
+                    final_chunk = chunk
+                    if chunk.content_delta:
+                        content_parts.append(chunk.content_delta)
+                    if chunk.usage.total_tokens:
+                        final_usage = chunk.usage
+                    if chunk.error:
+                        error = chunk.error
+                        status = "error"
+                    yield chunk
+            except Exception as stream_error:
+                error = str(stream_error)
+                error_type = self.fallback_service._error_type(stream_error)
+                status = "error"
+                final_chunk = final_chunk or LLMStreamChunk(
+                    request_id=request.request_id,
+                    provider=route.provider,
+                    model=route.model,
+                )
+                yield replace(
+                    final_chunk,
+                    content_delta="",
+                    finish_reason="error",
+                    error=error,
+                )
+
+        latency_ms = round(timer.duration_seconds * 1000)
+        response = LLMResponse(
+            request_id=request.request_id,
+            provider=(
+                final_chunk.provider
+                if final_chunk is not None
+                else route.provider
+            ),
+            model=final_chunk.model if final_chunk is not None else route.model,
+            status=status,
+            content="".join(content_parts),
+            usage=final_usage,
+            error=error,
+            trace_id=trace_id,
+            provider_status_code=200 if status == "success" else None,
+            fallback_used=fallback_used,
+            fallback_from_provider=fallback_from_provider,
+            fallback_from_model=fallback_from_model,
+            latency_ms=latency_ms,
+            error_type=error_type,
+        )
+        response_size = self._payload_size(response)
+        persisted_request = replace(
+            request,
+            metadata={
+                **request.metadata,
+                "endpoint": endpoint,
+                "trace_id": trace_id,
+                "request_size": request_size,
+            },
+        )
+        self.request_repository.save(persisted_request, response)
+        self.observability_service.record(
+            response=response,
+            endpoint=endpoint,
+            duration_seconds=timer.duration_seconds,
+            request_size=request_size,
+            response_size=response_size,
         )
 
     async def embeddings(self, request: LLMRequest) -> LLMResponse:
@@ -108,3 +253,26 @@ class LLMGatewayService(ForManagingLLMRequests):
 
     def _payload_size(self, payload) -> int:
         return len(json.dumps(asdict(payload), default=str))
+
+    def _provider_stream(
+        self,
+        request: LLMRequest,
+        provider_name: str,
+        model: str,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        provider = self.providers[provider_name]
+        routed_request = replace(request, model=model, stream=True)
+        return provider.stream_chat_completion(routed_request)
+
+    async def _chain_first(
+        self,
+        first_chunk: LLMStreamChunk,
+        stream: AsyncIterator[LLMStreamChunk],
+    ) -> AsyncIterator[LLMStreamChunk]:
+        yield first_chunk
+        async for chunk in stream:
+            yield chunk
+
+    async def _empty_stream(self) -> AsyncIterator[LLMStreamChunk]:
+        if False:
+            yield

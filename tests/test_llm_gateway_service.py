@@ -11,7 +11,7 @@ from application.services.llm_gateway_service import LLMGatewayService
 from application.services.observability_service import ObservabilityService
 from application.services.routing_service import RoutingService
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse, TokenUsage
+from domain.llm_response import LLMResponse, LLMStreamChunk, TokenUsage
 from domain.provider_name import ProviderName
 
 
@@ -41,6 +41,31 @@ class FakeProvider:
             model=request.model or "missing-model",
             status="success",
             content=self.content or f"{self.provider_name.value} response",
+            usage=TokenUsage(
+                prompt_tokens=1,
+                completion_tokens=2,
+                total_tokens=3,
+            ),
+        )
+
+    async def stream_chat_completion(self, request: LLMRequest):
+        self.requests.append(request)
+        if self.timeout:
+            raise TimeoutError(f"{self.provider_name.value} timed out")
+        if self.fail:
+            raise RuntimeError(f"{self.provider_name.value} failed")
+        yield LLMStreamChunk(
+            request_id=request.request_id,
+            provider=self.provider_name,
+            model=request.model or "missing-model",
+            content_delta="hello",
+        )
+        yield LLMStreamChunk(
+            request_id=request.request_id,
+            provider=self.provider_name,
+            model=request.model or "missing-model",
+            content_delta=" world",
+            finish_reason="stop",
             usage=TokenUsage(
                 prompt_tokens=1,
                 completion_tokens=2,
@@ -108,6 +133,10 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def _collect(stream):
+    return [chunk async for chunk in stream]
+
+
 def test_chat_completion_uses_default_provider_and_model(tmp_path):
     gateway, providers, repository, metrics = make_gateway(tmp_path)
     request = LLMRequest.chat(
@@ -126,6 +155,57 @@ def test_chat_completion_uses_default_provider_and_model(tmp_path):
     assert saved_request.metadata["endpoint"] == "/v1/chat/completions"
     assert saved_response == response
     assert sum(metrics.requests_total.values()) == 1
+
+
+def test_chat_request_accepts_stream_flag():
+    request = LLMRequest.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    assert request.stream is True
+
+
+def test_stream_chat_completion_persists_aggregated_response(tmp_path):
+    gateway, providers, repository, metrics = make_gateway(tmp_path)
+    request = LLMRequest.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    chunks = run(_collect(gateway.stream_chat_completion(request)))
+
+    assert [chunk.content_delta for chunk in chunks] == ["hello", " world"]
+    assert chunks[-1].finish_reason == "stop"
+    assert providers[ProviderName.OLLAMA.value].requests[0].stream is True
+    saved_request, saved_response = repository.find_by_request_id(
+        request.request_id,
+    )
+    assert saved_request.metadata["endpoint"] == "/v1/chat/completions"
+    assert saved_response.content == "hello world"
+    assert saved_response.usage.total_tokens == 3
+    assert sum(metrics.requests_total.values()) == 1
+
+
+def test_stream_chat_completion_falls_back_before_first_chunk(tmp_path):
+    gateway, providers, repository, _ = make_gateway(
+        tmp_path,
+        ollama_fail=True,
+    )
+    request = LLMRequest.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    chunks = run(_collect(gateway.stream_chat_completion(request)))
+
+    assert chunks[0].provider == ProviderName.LLAMA_CPP
+    assert chunks[-1].finish_reason == "stop"
+    assert len(providers[ProviderName.OLLAMA.value].requests) == 1
+    assert len(providers[ProviderName.LLAMA_CPP.value].requests) == 1
+    saved_response = repository.find_by_request_id(request.request_id)[1]
+    assert saved_response.fallback_used is True
+    assert saved_response.fallback_from_provider == ProviderName.OLLAMA
 
 
 def test_explicit_provider_has_priority(tmp_path):

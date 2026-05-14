@@ -1,12 +1,13 @@
 import asyncio
+import json
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from configurator import configure_gateway_container
 from domain.llm_request import LLMRequest
-from domain.llm_response import LLMResponse
+from domain.llm_response import LLMResponse, LLMStreamChunk
 
 
 container = configure_gateway_container()
@@ -23,13 +24,20 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
+async def chat_completions(payload: dict[str, Any]):
     request = LLMRequest.chat(
         messages=payload.get("messages", []),
         model=payload.get("model"),
         provider=payload.get("provider"),
+        stream=bool(payload.get("stream", False)),
         metadata={"raw_request": payload},
     )
+    if request.stream:
+        return StreamingResponse(
+            _chat_completion_event_stream(request),
+            media_type="text/event-stream",
+        )
+
     response = await container.gateway.chat_completion(request)
     if not response.is_success:
         raise HTTPException(
@@ -37,6 +45,13 @@ async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
             detail=_response_to_chat_payload(response),
         )
     return _response_to_chat_payload(response)
+
+
+async def _chat_completion_event_stream(request: LLMRequest):
+    async for chunk in container.gateway.stream_chat_completion(request):
+        yield f"data: {json.dumps(_chunk_to_chat_payload(chunk))}\n\n"
+        if chunk.finish_reason:
+            yield "data: [DONE]\n\n"
 
 
 def _response_to_chat_payload(response: LLMResponse) -> dict[str, Any]:
@@ -60,6 +75,29 @@ def _response_to_chat_payload(response: LLMResponse) -> dict[str, Any]:
         "usage": response.usage.__dict__,
         "error": response.error,
     }
+
+
+def _chunk_to_chat_payload(chunk: LLMStreamChunk) -> dict[str, Any]:
+    delta = {}
+    if chunk.content_delta:
+        delta["content"] = chunk.content_delta
+    payload = {
+        "id": chunk.request_id,
+        "object": "chat.completion.chunk",
+        "model": chunk.model,
+        "provider": chunk.provider.value,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": chunk.finish_reason,
+            }
+        ],
+        "error": chunk.error,
+    }
+    if chunk.usage.total_tokens:
+        payload["usage"] = chunk.usage.__dict__
+    return payload
 
 
 @app.post("/v1/embeddings")
